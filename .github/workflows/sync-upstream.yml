@@ -1,0 +1,59 @@
+name: sync upstream
+
+# Merges kaixxx/noScribe's main into this fork's main once a day. A merge
+# rather than a reset or rebase, so the fork's own commits (such as the
+# telemetry switch-off in noScribe/privacy.py) stay on top of upstream and the
+# published history is never rewritten.
+#
+# Pushes made with the default GITHUB_TOKEN are refused when the merge touches
+# a file in .github/workflows/, and they do not trigger the pytest/pyinstaller
+# workflows either. Both work once a repository secret UPSTREAM_SYNC_TOKEN
+# holds a fine-grained token for this repository with "Contents" and
+# "Workflows" read/write access.
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Upstream itself has nothing to sync from.
+    if: github.repository != 'kaixxx/noScribe'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/kaixxx/noScribe.git
+          git fetch --no-tags upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "main already contains upstream/main."
+            exit 0
+          fi
+
+          if ! git merge --no-edit upstream/main; then
+            git merge --abort
+            echo "::error::upstream/main conflicts with this fork's main. Merge it by hand: git fetch upstream && git merge upstream/main"
+            exit 1
+          fi
+
+          if ! git push origin HEAD:main; then
+            echo "::error::Push refused. If upstream changed .github/workflows/, the default token may not push it: add an UPSTREAM_SYNC_TOKEN secret (see the comment at the top of this workflow)."
+            exit 1
+          fi
