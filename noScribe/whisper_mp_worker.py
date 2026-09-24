@@ -13,6 +13,8 @@ else:
 
 from i18n import t
 
+from . import privacy
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,6 +35,9 @@ def whisper_proc_entrypoint(args: dict, q):
         import torch
         import yaml
         import i18n
+
+        # Before the VAD (vad_filter=True below) creates its onnxruntime session.
+        privacy.disable_onnxruntime_telemetry()
 
         def plog(level, msg):
             try:

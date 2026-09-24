@@ -56,7 +56,7 @@ from faster_whisper.vad import VadOptions, get_speech_timestamps
 from i18n import t
 from PIL import Image
 
-from . import audio, exception, transcription, utils
+from . import audio, exception, privacy, transcription, utils
 from .CTkToolTips import CTkToolTip
 from .tkHyperlinkManager import HyperlinkManager
 
@@ -2952,6 +2952,7 @@ class App(ctk.CTk):
                         vad_parameters = VadOptions(min_silence_duration_ms=500,
                                                     onset=job.vad_threshold,
                                                     speech_pad_ms=0)
+                    privacy.disable_onnxruntime_telemetry()
                     speech_chunks = get_speech_timestamps(audio_array, vad_parameters)
                     # Pause adjustment only needs timestamps and duration from here on.
                     del audio_array
