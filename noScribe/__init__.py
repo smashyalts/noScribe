@@ -10,8 +10,15 @@ into every worker child. The submodules are therefore loaded lazily (PEP 562);
 PyInstaller cannot follow these imports, so every spec in pyinstaller/ lists
 ``noScribe.main`` in its hiddenimports -- without that the frozen app dies at
 startup with ModuleNotFoundError.
+
+The one eager import is ``privacy``: it is stdlib-only, and switching off the
+dependencies' telemetry has to happen before any submodule can import them.
 """
 import importlib as _importlib
+
+from . import privacy as _privacy
+
+_privacy.disable_telemetry()
 
 # Everything main.py used to bind on the package as a side effect of being
 # imported eagerly. Kept so `import noScribe; noScribe.utils...` still works
