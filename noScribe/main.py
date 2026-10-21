@@ -59,6 +59,7 @@ from PIL import Image
 from . import audio, exception, privacy, transcription, utils
 from .CTkToolTips import CTkToolTip
 from .tkHyperlinkManager import HyperlinkManager
+from .worker_errors import WorkerError, WorkerRetryError
 
 if platform.system() == "Darwin": # = MAC
     from subprocess import check_output
@@ -207,21 +208,9 @@ def get_config_flag(key: str, default: bool) -> bool:
         return False
     return default
 
+# Runtime CPU fallback must not overwrite these saved preferences.
 force_pyannote_cpu = get_config_flag('force_pyannote_cpu', False)
 force_whisper_cpu = get_config_flag('force_whisper_cpu', False)
-
-_CUDA_ERROR_KEYWORDS = (
-    'cuda',
-    'cublas',
-    'cudnn',
-    'cufft',
-    'device-side assert',
-    'invalid device function',
-    'nccl',
-    'gpu driver',
-    'compute capability',
-    'hip error',
-)
 
 PAUSE_OPTIONS = ['none', '1sec+', '2sec+', '3sec+']
 
@@ -242,14 +231,6 @@ def pause_label(pause) -> str:
             and 0 <= pause < len(PAUSE_OPTIONS):
         return PAUSE_OPTIONS[pause]
     return str(pause)
-
-def _is_cuda_error_message(message: str) -> bool:
-    if not message:
-        return False
-    if message.find('(device_cpu)') != -1:
-        return False
-    lower_message = message.lower()
-    return any(keyword in lower_message for keyword in _CUDA_ERROR_KEYWORDS)
 
 def version_higher(version1, version2, subversion_level=99) -> int:
     """Will return 
@@ -362,6 +343,9 @@ class TranscriptionJob:
         self.transcript_file: str = ''
         # Partial transcript tracking
         self.has_partial_transcript: bool = False
+        self.whisper_cpu_fallback: bool = False
+        self.pyannote_cpu_fallback: bool = False
+        self.gpu_errors: dict = {}
         
         # Time range
         self.start: int = 0  # milliseconds
@@ -399,6 +383,9 @@ class TranscriptionJob:
     
     def set_running(self):
         """Mark job as running and record start time"""
+        self.whisper_cpu_fallback = False
+        self.pyannote_cpu_fallback = False
+        self.gpu_errors = {}
         self.status = JobStatus.AUDIO_CONVERSION
         self.started_at = datetime.datetime.now()
         # Names are assigned in order of first appearance, so the mapping has
@@ -2427,8 +2414,6 @@ class App(ctk.CTk):
         config['last_overlapping'] = self.check_box_overlapping.get()
         config['last_timestamps'] = self.check_box_timestamps.get()
         config['last_disfluencies'] = self.check_box_disfluencies.get()
-        config['force_pyannote_cpu'] = str(force_pyannote_cpu)
-        config['force_whisper_cpu'] = str(force_whisper_cpu)
         save_config()
 
     def collect_transcription_options(self) -> TranscriptionQueue:
@@ -2856,8 +2841,7 @@ class App(ctk.CTk):
                                 diarization = self._run_diarize_subprocess(tmp_audio_file, job)
                                 break
                             except Exception as err:
-                                if self._handle_cuda_fallback('pyannote', err):
-                                    self.logn(t('pyannote_cuda_retry'), 'highlight')
+                                if self._handle_cuda_fallback('pyannote', err, job):
                                     continue
                                 raise
 
@@ -3222,7 +3206,7 @@ class App(ctk.CTk):
                         self.logn()
                         self.logn(t('transcription_finished'), 'highlight')
                     except Exception as err:
-                        if self._handle_cuda_fallback('whisper', err):
+                        if self._handle_cuda_fallback('whisper', err, job):
                             retry_cuda = True
                         else:
                             raise
@@ -3251,7 +3235,6 @@ class App(ctk.CTk):
                                     link=f'file://{job.transcript_file}'
                                 )
                     if retry_cuda:
-                        self.logn(t('whisper_cuda_retry'), 'highlight')
                         continue
                     else:
                         break
@@ -3327,36 +3310,38 @@ class App(ctk.CTk):
             self.logn(f'Error starting transcription: {str(e)}', 'error')
             tk.messagebox.showerror(title='noScribe', message=f'Error starting transcription: {str(e)}')
 
-    def _handle_cuda_fallback(self, component: str, error: Exception) -> bool:
-        global force_pyannote_cpu
-        global force_whisper_cpu
-        message = str(error).strip()
-        if not _is_cuda_error_message(message):
+    def _handle_cuda_fallback(self, component: str, error: Exception, job: TranscriptionJob) -> bool:
+        """Automatically retry the affected component once on CPU for this job."""
+        # Cancellation is never a failed retry, even if an earlier GPU attempt
+        # failed. Parent-side errors (e.g. saving segments) are not GPU errors.
+        if getattr(self, 'cancel', False) or str(error) == t('err_user_cancelation'):
+            return False
+        if component in job.gpu_errors:
+            raise WorkerRetryError(job.gpu_errors[component], error) from error
+        if not isinstance(error, WorkerError) or not error.allows_cpu_retry:
             return False
 
         if component == 'pyannote':
-            if force_pyannote_cpu:
+            if force_pyannote_cpu or job.pyannote_cpu_fallback:
                 return False
-            prompt = t('pyannote_cuda_error_prompt', error=message)
-            if tk.messagebox.askyesno(title='noScribe', message=prompt):
-                force_pyannote_cpu = True
-                config['force_pyannote_cpu'] = 'true'
-                save_config()
-                return True
+            job.pyannote_cpu_fallback = True
+        elif component == 'whisper':
+            if force_whisper_cpu or job.whisper_cpu_fallback:
+                return False
+            job.whisper_cpu_fallback = True
+        else:
             return False
 
-        if component == 'whisper':
-            if force_whisper_cpu:
-                return False
-            prompt = t('whisper_cuda_error_prompt', error=message)
-            if tk.messagebox.askyesno(title='noScribe', message=prompt):
-                force_whisper_cpu = True
-                config['force_whisper_cpu'] = 'true'
-                save_config()
-                return True
-            return False
-
-        return False
+        job.gpu_errors[component] = error
+        if error.classification == 'worker_crash':
+            message = t('gpu_worker_crash_retry',
+                        component='PyAnnote' if component == 'pyannote' else 'Whisper',
+                        exitcode=error.exitcode, stage=error.stage,
+                        option=f'force_{component}_cpu')
+        else:
+            message = t(f'{component}_cuda_retry')
+        self.logn(message, 'highlight')
+        return True
 
     def _run_whisper_subprocess_stream(self, tmp_audio_file: str, job, on_segment):
         """Spawn a subprocess to run Faster-Whisper and stream segments.
@@ -3380,7 +3365,7 @@ class App(ctk.CTk):
 
         args = {
             "whisper_model": job.whisper_model,
-            "device": 'cpu' if force_whisper_cpu else 'auto',
+            "device": 'cpu' if force_whisper_cpu or job.whisper_cpu_fallback else 'auto',
             "compute_type": job.whisper_compute_type,
             "cpu_threads": number_threads,
             "local_files_only": True,
@@ -3406,6 +3391,7 @@ class App(ctk.CTk):
         self._mp_queue = q
 
         info = None
+        worker_state = {'device': 'cpu' if args['device'] == 'cpu' else None, 'stage': 'starting'}
         try:
             while True:
                 try:
@@ -3422,11 +3408,13 @@ class App(ctk.CTk):
                         # Process died without sending result
                         exitcode = proc.exitcode
                         self.logn(f"Transcription worker exited unexpectedly (code {exitcode}).", 'error')
-                        raise Exception('Subprocess terminated unexpectedly')
+                        raise WorkerError.unexpected_exit(exitcode, worker_state)
                     continue
 
                 mtype = msg.get("type") if isinstance(msg, dict) else None
-                if mtype == "log":
+                if mtype == 'state':
+                    worker_state = {'device': msg.get('device'), 'stage': msg.get('stage')}
+                elif mtype == "log":
                     level = msg.get("level", "info")
                     txt = msg.get("msg", "")
                     if level == 'error':
@@ -3461,7 +3449,7 @@ class App(ctk.CTk):
                         self.logn(f"Transcription failed: {err}", 'error')
                         if trc:
                             self.logn(trc, where='file')
-                        raise Exception(err)
+                        raise WorkerError(msg)
                     break
                 # keep looping until we get a result
         finally:
@@ -3503,7 +3491,7 @@ class App(ctk.CTk):
         q = ctx.Queue()
         from .pyannote_mp_worker import pyannote_proc_entrypoint
         args = {
-            "device": 'cpu' if force_pyannote_cpu else '',
+            "device": 'cpu' if force_pyannote_cpu or job.pyannote_cpu_fallback else '',
             "audio_path": tmp_audio_file,
             "num_speakers": (int(job.speaker_detection) if str(job.speaker_detection).isdigit() else None),
         }
@@ -3514,6 +3502,7 @@ class App(ctk.CTk):
         self._mp_queue = q
 
         diarization = None
+        worker_state = {'device': 'cpu' if args['device'] == 'cpu' else None, 'stage': 'starting'}
         try:
             while True:
                 try:
@@ -3528,11 +3517,13 @@ class App(ctk.CTk):
                     if not proc.is_alive():
                         exitcode = proc.exitcode
                         self.logn(f"Diarization worker exited unexpectedly (code {exitcode}). UI remains responsive.", 'error')
-                        raise Exception('Subprocess terminated unexpectedly')
+                        raise WorkerError.unexpected_exit(exitcode, worker_state)
                     continue
 
                 mtype = msg.get("type") if isinstance(msg, dict) else None
-                if mtype == "log":
+                if mtype == 'state':
+                    worker_state = {'device': msg.get('device'), 'stage': msg.get('stage')}
+                elif mtype == "log":
                     txt = msg.get("msg", "")
                     self.logn('PyAnnote ' + txt, where='file')
                 elif mtype == "progress":
@@ -3552,7 +3543,7 @@ class App(ctk.CTk):
                         self.logn(f"PyAnnote error: {err}", 'error')
                         if trc:
                             self.logn(trc, where='file')
-                        raise Exception(err)
+                        raise WorkerError(msg)
                     break
 
         finally:
