@@ -3525,7 +3525,8 @@ class App(ctk.CTk):
                     worker_state = {'device': msg.get('device'), 'stage': msg.get('stage')}
                 elif mtype == "log":
                     txt = msg.get("msg", "")
-                    self.logn('PyAnnote ' + txt, where='file')
+                    where = 'both' if msg.get("level") == "info" else 'file'
+                    self.logn('PyAnnote: ' + txt, where=where)
                 elif mtype == "progress":
                     step_name = str(msg.get("step", ""))
                     progress_percent = int(msg.get("pct", 0))
@@ -3866,30 +3867,28 @@ def noScribeMain():
     #
     # Using memoization (keeps all translations in memory instead of loading
     # each translation from file). This should make things faster and increased
-    # memory usage should be negligible (in the case of a ML app). This way, it
-    # is possible to use `importlib.ressources` to provide the translation file
-    # once and i18n does not need to access it later. However, it is necessary
-    # to translate one string to have it available throughout the app lifetime.
+    # memory usage should be negligible (in the case of a ML app). i18n still
+    # reads the load path again for keys it has not memoized yet (a missing
+    # key, or the fallback to "en"), so the path must stay valid for the whole
+    # run; see `utils.translations_dir()`.
     i18n.set("filename_format", "{locale}.{format}")
     i18n.set("enable_memoization", True)
     i18n.set("fallback", "en")
     i18n.set("locale", app_locale)
 
-    with impres.as_file(impres.files("trans")) as mypath:
-        i18n.load_path.append(mypath)
-
-        try:
-            print("\nnoScribe")
-            print(t("app_header"), "\n")
-        except Exception as e:
-            logger.error(
-                "Failed to load localization files. "
-                "noScribe cannot start without them and needs to close."
-            )
-            _show_startup_error(
-                "noScribe could not load localization files and needs to close."
-            )
-            raise exception.LocalizationLoadingError from e
+    try:
+        i18n.load_path.append(utils.translations_dir())
+        print("\nnoScribe")
+        print(t("app_header"), "\n")
+    except Exception as e:
+        logger.error(
+            "Failed to load localization files. "
+            "noScribe cannot start without them and needs to close."
+        )
+        _show_startup_error(
+            "noScribe could not load localization files and needs to close."
+        )
+        raise exception.LocalizationLoadingError from e
 
     # Parse command line arguments
     args = parse_cli_args()

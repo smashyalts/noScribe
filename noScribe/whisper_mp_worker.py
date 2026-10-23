@@ -11,6 +11,7 @@ else:
     import importlib_resources as impres
 
 from i18n import t
+from .utils import translations_dir
 from .worker_errors import WorkerState
 
 from . import privacy
@@ -61,12 +62,11 @@ def whisper_proc_entrypoint(args: dict, q):
         i18n.set("fallback", "en")
         i18n.set("locale", args.get("locale", "en"))
 
-        with impres.as_file(impres.files("trans")) as mypath:
-            i18n.load_path.append(mypath)
+        i18n.load_path.append(translations_dir())
 
-            # Using `t` once here to load the localization files into memory.
-            # As there is no `print`, nothing happens really.
-            t("app_header")
+        # Using `t` once here to load the localization files into memory.
+        # As there is no `print`, nothing happens really.
+        t("app_header")
         
         state.update('device_selection')
         # determine device
@@ -92,6 +92,7 @@ def whisper_proc_entrypoint(args: dict, q):
             local_files_only=args.get("local_files_only", True),
         )
         state.update('audio_loading', device=getattr(model.model, 'device', device))
+        plog("info", f"Whisper: using {state.device}")
 
         # Define callbacks that forward to parent via queue (not used by faster-whisper directly, but kept for parity)
         def log_cb(level, msg):
